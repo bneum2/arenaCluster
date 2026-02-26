@@ -125,6 +125,20 @@
   }
   let showImageThumbnails = true; // Toggle to hide images for better performance
   let hoveredBlockId = null;
+  let clusterRotationAngle = 0;
+
+  // Group blocks by cluster for per-cluster rotation
+  $: clusters = (() => {
+    const byId = {};
+    for (const block of positionedBlocks) {
+      const cid = block.clusterId;
+      if (byId[cid] == null) {
+        byId[cid] = { clusterId: cid, centerX: block.clusterCenterX, centerY: block.clusterCenterY, blocks: [] };
+      }
+      byId[cid].blocks.push(block);
+    }
+    return Object.values(byId);
+  })();
 
   // Fetch all blocks from the channel
   async function fetchAllBlocks() {
@@ -731,12 +745,15 @@
       // Angle from cluster center to this block (used for hover direction in template)
       const len = Math.sqrt(offsetX * offsetX + offsetY * offsetY);
       const hoverAngle = len > 0 ? Math.atan2(offsetY, offsetX) : -Math.PI / 2; // up if at center
-      
+      const centerX = clusterPos.x + (canvasWidth * .5);
+      const centerY = clusterPos.y + (canvasHeight * .5);
       return {
         ...block,
         x: clusterPos.x + offsetX + (canvasWidth * .5),
         y: clusterPos.y + offsetY + (canvasHeight * .5),
         clusterId: clusterId,
+        clusterCenterX: centerX,
+        clusterCenterY: centerY,
         hoverAngle
       };
     });
@@ -1004,8 +1021,17 @@
     };
     window.addEventListener('resize', handleResize);
     
+    // Slow rotation for each cluster (degrees per frame ~= 0.1 → ~60s per full rotation)
+    let rafId;
+    function tickRotation() {
+      clusterRotationAngle = (clusterRotationAngle + 0.03) % 360;
+      rafId = requestAnimationFrame(tickRotation);
+    }
+    rafId = requestAnimationFrame(tickRotation);
+    
     return () => {
       window.removeEventListener('resize', handleResize);
+      cancelAnimationFrame(rafId);
     };
   });
 </script>
@@ -1069,19 +1095,21 @@
           role="application"
           aria-label="Interactive visualization of Are.na blocks"
         >
-          <!-- Draw blocks as circles/rects -->
-          {#each positionedBlocks as block}
-            {@const isHovered = hoveredBlockId === block.id}
-            {@const hoverDist = 18}
-            {@const hoverDx = (isHovered && block.hoverAngle != null) ? Math.cos(block.hoverAngle) * hoverDist : 0}
-            {@const hoverDy = (isHovered && block.hoverAngle != null) ? Math.sin(block.hoverAngle) * hoverDist : 0}
-            <g 
-              class="block-node"
-              class:selected={isBlockSelected(block)}
-              class:hovered={isHovered}
-              transform={isHovered && block.hoverAngle != null
-                ? `translate(${block.x + hoverDx}, ${block.y + hoverDy}) scale(1.3)`
-                : `translate(${block.x}, ${block.y}) scale(1)`}
+          <!-- Draw blocks as circles/rects; each cluster rotates slowly around its center -->
+          {#each clusters as cluster}
+            <g transform="translate({cluster.centerX}, {cluster.centerY}) rotate({clusterRotationAngle})">
+              {#each cluster.blocks as block}
+                {@const isHovered = hoveredBlockId === block.id}
+                {@const hoverDist = 18}
+                {@const hoverDx = (isHovered && block.hoverAngle != null) ? Math.cos(block.hoverAngle) * hoverDist : 0}
+                {@const hoverDy = (isHovered && block.hoverAngle != null) ? Math.sin(block.hoverAngle) * hoverDist : 0}
+                <g 
+                  class="block-node"
+                  class:selected={isBlockSelected(block)}
+                  class:hovered={isHovered}
+                  transform={isHovered && block.hoverAngle != null
+                    ? `translate(${block.x - cluster.centerX + hoverDx}, ${block.y - cluster.centerY + hoverDy}) rotate(${-clusterRotationAngle}) scale(1.3)`
+                    : `translate(${block.x - cluster.centerX}, ${block.y - cluster.centerY}) rotate(${-clusterRotationAngle}) scale(1)`}
               on:mouseenter={(e) => handleMouseMove(e, block)}
               on:mouseleave={handleMouseLeave}
               on:mousedown|stopPropagation
@@ -1167,6 +1195,8 @@
                 {/if}
               {/if}
               </g>
+            </g>
+              {/each}
             </g>
           {/each}
         </svg>
