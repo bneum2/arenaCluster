@@ -48,6 +48,9 @@
     { slug: 'idk-n-yi8fdktls' },
   ];
 
+  /** Cache of preloaded channel data (slug -> { blocks, stats, positionedBlocks }) */
+  let channelCache = {};
+
   let channelSlug = null; // set when user enters a link or picks a suggestion
   let channelInput = '';
 
@@ -70,8 +73,17 @@
   function loadChannel(slug) {
     const s = slug || slugFromInput(channelInput);
     if (!s) return;
-    channelSlug = s;
     channelInput = '';
+    if (channelCache[s]) {
+      channelSlug = s;
+      blocks = channelCache[s].blocks;
+      stats = channelCache[s].stats;
+      positionedBlocks = channelCache[s].positionedBlocks;
+      error = null;
+      setTimeout(() => autoFitView(), 100);
+      return;
+    }
+    channelSlug = s;
     fetchAllBlocks();
   }
 
@@ -140,77 +152,65 @@
     return Object.values(byId);
   })();
 
+  /** Fetch and position channel data for a given slug. Returns { blocks, stats, positionedBlocks } (does not update UI). */
+  async function fetchChannelData(slug) {
+    const arena = new Arena();
+    const firstPage = await arena.channel(slug).get({ page: 1, per: 100 });
+    const totalBlocks = firstPage.length;
+    const totalPages = Math.ceil(totalBlocks / 100);
+    let allBlocks = [...(firstPage.contents || [])];
+    const maxPages = Math.min(totalPages, 5);
+    for (let page = 2; page <= maxPages; page++) {
+      const pageData = await arena.channel(slug).get({ page, per: 100 });
+      allBlocks.push(...(pageData.contents || []));
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+    const processedBlocks = allBlocks.map(block => {
+      const imageUrl = block.image?.thumb?.url || block.image?.display?.url || block.image?.large?.url;
+      const isGif = imageUrl && (imageUrl.toLowerCase().endsWith('.gif') || imageUrl.includes('.gif?'));
+      return {
+        id: block.id,
+        type: block.class,
+        title: block.title || '',
+        description: block.description || '',
+        content: block.content || block.content_html || '',
+        image: isGif ? null : imageUrl,
+        isGif: isGif,
+        source: block.source?.url,
+        created: new Date(block.created_at),
+        textContent: [
+          block.title,
+          block.description,
+          block.content,
+          block.class === 'Link' ? block.source?.url : ''
+        ].filter(Boolean).join(' ').substring(0, 1000)
+      };
+    }).filter(b => !b.isGif);
+    const channelStats = {
+      total: processedBlocks.length,
+      images: processedBlocks.filter(b => b.type === 'Image').length,
+      text: processedBlocks.filter(b => b.type === 'Text').length,
+      other: processedBlocks.filter(b => !['Image', 'Text'].includes(b.type)).length
+    };
+    const imageBlocks = processedBlocks.filter(b => b.type === 'Image');
+    const positioned = await positionBlocksWithKMeans(imageBlocks);
+    return { blocks: processedBlocks, stats: channelStats, positionedBlocks: positioned };
+  }
+
   // Fetch all blocks from the channel
   async function fetchAllBlocks() {
     try {
       loading = true;
-      const arena = new Arena();
-      
-      const firstPage = await arena.channel(channelSlug).get({ page: 1, per: 100 });
-      const totalBlocks = firstPage.length;
-      const totalPages = Math.ceil(totalBlocks / 100);
-      
-      console.log(`Channel: ${firstPage.title}`);
-      console.log(`Total blocks: ${totalBlocks}`);
-      
-      let allBlocks = [...(firstPage.contents || [])];
-      
-      // Fetch remaining pages (limit to 5 pages = 500 blocks)
-      const maxPages = Math.min(totalPages, 5);
-      for (let page = 2; page <= maxPages; page++) {
-        const pageData = await arena.channel(channelSlug).get({ page, per: 100 });
-        allBlocks.push(...(pageData.contents || []));
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-      
-      console.log(`Fetched ${allBlocks.length} blocks`);
-      
-      // Process blocks
-      blocks = allBlocks.map(block => {
-        // Prioritize thumbnails for performance (we only need small images)
-        const imageUrl = block.image?.thumb?.url || block.image?.display?.url || block.image?.large?.url;
-        const isGif = imageUrl && (imageUrl.toLowerCase().endsWith('.gif') || imageUrl.includes('.gif?'));
-        
-        return {
-          id: block.id,
-          type: block.class,
-          title: block.title || '',
-          description: block.description || '',
-          content: block.content || block.content_html || '',
-          image: isGif ? null : imageUrl,
-          isGif: isGif,
-          source: block.source?.url,
-          created: new Date(block.created_at),
-          
-          // Text content for embedding
-          textContent: [
-            block.title,
-            block.description, 
-            block.content,
-            block.class === 'Link' ? block.source?.url : ''
-          ].filter(Boolean).join(' ').substring(0, 1000)
-        };
-      }).filter(b => !b.isGif); // Exclude GIFs — only load static images
-      
-      // Calculate stats
-      stats.total = blocks.length;
-      stats.images = blocks.filter(b => b.type === 'Image').length;
-      stats.text = blocks.filter(b => b.type === 'Text').length;
-      stats.other = blocks.filter(b => !['Image', 'Text'].includes(b.type)).length;
-      
-      // Use fast k-means clustering by color (only image blocks on the page)
-      const imageBlocks = blocks.filter(b => b.type === 'Image');
-      positionedBlocks = await positionBlocksWithKMeans(imageBlocks);
-      
-      // Auto-fit view to show all blocks
-      setTimeout(() => {
-        autoFitView();
-      }, 100);
-      
-      loading = false;
+      const data = await fetchChannelData(channelSlug);
+      blocks = data.blocks;
+      stats = data.stats;
+      positionedBlocks = data.positionedBlocks;
+      channelCache[channelSlug] = data;
+      setTimeout(() => autoFitView(), 100);
     } catch (err) {
       console.error('Error fetching blocks:', err);
       error = err.message;
+    } finally {
       loading = false;
     }
   }
@@ -1020,6 +1020,16 @@
       canvasHeight = window.innerHeight;
     };
     window.addEventListener('resize', handleResize);
+    
+    // Preload suggested channels so they load instantly when clicked
+    for (const ch of SUGGESTED_CHANNELS) {
+      fetchChannelData(ch.slug)
+        .then((data) => {
+          channelCache[ch.slug] = data;
+          channelCache = channelCache;
+        })
+        .catch(() => {});
+    }
     
     // Slow rotation for each cluster (degrees per frame ~= 0.1 → ~60s per full rotation)
     let rafId;
