@@ -192,8 +192,7 @@
       text: processedBlocks.filter(b => b.type === 'Text').length,
       other: processedBlocks.filter(b => !['Image', 'Text'].includes(b.type)).length
     };
-    const imageBlocks = processedBlocks.filter(b => b.type === 'Image');
-    const positioned = await positionBlocksWithKMeans(imageBlocks);
+    const positioned = await positionBlocksWithEmbeddings(processedBlocks);
     return { blocks: processedBlocks, stats: channelStats, positionedBlocks: positioned };
   }
 
@@ -826,11 +825,43 @@
     const coords2D = reduceTo2D(embeddings);
     
     // Map to canvas space
-    return blocks.map((block, i) => ({
+    const withCoords = blocks.map((block, i) => ({
       ...block,
       x: coords2D[i][0] * (canvasWidth * 0.8) + canvasWidth * 0.1,
       y: coords2D[i][1] * (canvasHeight * 0.8) + canvasHeight * 0.1,
     }));
+    
+    // Assign clusters from 2D layout so cluster/rotation UI still works
+    const numClusters = Math.min(Math.max(5, Math.floor(blocks.length / 20)), 15);
+    const coordFeatures = withCoords.map(b => [b.x, b.y]);
+    const { clusters: clusterIds } = simpleKMeans(coordFeatures, numClusters, 50);
+    const clusterPositions = {};
+    clusterIds.forEach((cid, i) => {
+      if (!clusterPositions[cid]) clusterPositions[cid] = { x: 0, y: 0, count: 0 };
+      clusterPositions[cid].x += withCoords[i].x;
+      clusterPositions[cid].y += withCoords[i].y;
+      clusterPositions[cid].count++;
+    });
+    Object.keys(clusterPositions).forEach(cid => {
+      const p = clusterPositions[cid];
+      p.x /= p.count;
+      p.y /= p.count;
+    });
+    
+    return withCoords.map((block, i) => {
+      const cid = clusterIds[i];
+      const center = clusterPositions[cid];
+      const dx = block.x - center.x;
+      const dy = block.y - center.y;
+      const hoverAngle = (dx !== 0 || dy !== 0) ? Math.atan2(dy, dx) : -Math.PI / 2;
+      return {
+        ...block,
+        clusterId: cid,
+        clusterCenterX: center.x,
+        clusterCenterY: center.y,
+        hoverAngle,
+      };
+    });
   }
 
   /* 
