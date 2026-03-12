@@ -40,6 +40,8 @@
   const PLOT_MARGIN_RATIO = 0.1;
   const LOADING_OVERSCAN_SCALE = 1.08;
   const FETCH_SPAWN_OVERSCAN_RATIO = 0.14;
+  const FULL_RENDER_POINT_THRESHOLD = 2500;
+  const TARGET_MAX_VISIBLE_POINTS_LARGE = 500;
 
   $: progressRatio = pipelineProgress.total
     ? Math.max(0, Math.min(1, pipelineProgress.completed / pipelineProgress.total))
@@ -181,7 +183,14 @@
     return new Map(placed.map((point) => [point.id, point]));
   }
 
-  $: plotScale = loading ? LOADING_OVERSCAN_SCALE : 1;
+  $: datasetScale =
+    positionedImages.length <= FULL_RENDER_POINT_THRESHOLD
+      ? 1
+      : Math.max(
+          1,
+          Math.sqrt(Math.max(1, positionedImages.length) / TARGET_MAX_VISIBLE_POINTS_LARGE)
+        );
+  $: plotScale = Math.max(loading ? LOADING_OVERSCAN_SCALE : 1, datasetScale);
   $: plotWidth = Math.round(viewportWidth * plotScale);
   $: plotHeight = Math.round(viewportHeight * plotScale);
   $: spriteSize = computeSpriteSize(positionedImages.length, plotWidth, plotHeight);
@@ -419,8 +428,10 @@
   {:else}
     <ScatterPlot
       points={imagePoints}
-      viewportWidth={plotWidth}
-      viewportHeight={plotHeight}
+      {viewportWidth}
+      {viewportHeight}
+      worldWidth={plotWidth}
+      worldHeight={plotHeight}
       {spriteSize}
       isLoading={loading}
       onHover={(point) => (hoveredBlock = point)}
