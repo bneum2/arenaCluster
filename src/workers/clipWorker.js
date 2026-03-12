@@ -1,11 +1,49 @@
-import { pipeline, env } from '@xenova/transformers';
-
-env.allowLocalModels = false;
-env.useBrowserCache = true;
-
 const MODEL_ID = 'Xenova/clip-vit-base-patch32';
 let extractorPromise = null;
 let modelStatusPosted = false;
+let transformersModulePromise = null;
+
+function getErrorMessage(errorLike) {
+  if (errorLike instanceof Error) return errorLike.message;
+  if (typeof errorLike?.message === 'string' && errorLike.message.length > 0) return errorLike.message;
+  return String(errorLike);
+}
+
+function postFatalError(message, details = null) {
+  try {
+    self.postMessage({
+      type: 'worker_fatal',
+      message,
+      details,
+    });
+  } catch {
+    // Ignore postMessage failures while reporting fatal worker errors.
+  }
+}
+
+self.addEventListener('error', (event) => {
+  postFatalError('Worker runtime error', {
+    message: getErrorMessage(event?.error || event?.message || 'Unknown error event'),
+    filename: event?.filename || null,
+    lineno: Number.isFinite(event?.lineno) ? event.lineno : null,
+    colno: Number.isFinite(event?.colno) ? event.colno : null,
+  });
+});
+
+self.addEventListener('unhandledrejection', (event) => {
+  const reason = event?.reason;
+  postFatalError('Worker unhandled rejection', {
+    message: getErrorMessage(reason),
+    stack: reason instanceof Error ? reason.stack : null,
+  });
+});
+
+async function getTransformersModule() {
+  if (!transformersModulePromise) {
+    transformersModulePromise = import('@xenova/transformers');
+  }
+  return transformersModulePromise;
+}
 
 async function getExtractor() {
   if (!extractorPromise) {
@@ -13,6 +51,9 @@ async function getExtractor() {
       self.postMessage({ type: 'model_loading', modelId: MODEL_ID });
       modelStatusPosted = true;
     }
+    const { pipeline, env } = await getTransformersModule();
+    env.allowLocalModels = false;
+    env.useBrowserCache = true;
     console.log('[worker] Loading CLIP model', MODEL_ID);
     extractorPromise = pipeline('image-feature-extraction', MODEL_ID);
     await extractorPromise;

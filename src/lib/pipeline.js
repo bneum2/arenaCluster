@@ -571,6 +571,22 @@ async function runWorkerPool({
       worker.onmessage = (event) => {
         clearStartupTimeout();
         const msg = event.data;
+        if (msg?.type === 'worker_fatal') {
+          console.error('[pipeline] Worker fatal message', msg);
+          const detailMessage =
+            typeof msg?.details?.message === 'string' && msg.details.message.trim().length > 0
+              ? msg.details.message.trim()
+              : null;
+          const location =
+            typeof msg?.details?.filename === 'string' &&
+            Number.isFinite(msg?.details?.lineno) &&
+            msg.details.lineno > 0
+              ? `${msg.details.filename}:${msg.details.lineno}${Number.isFinite(msg?.details?.colno) && msg.details.colno > 0 ? `:${msg.details.colno}` : ''}`
+              : null;
+          const reason = detailMessage || location || 'Unknown worker fatal error.';
+          reject(new Error(`Worker error: ${reason}`));
+          return;
+        }
         if (msg?.type === 'model_loading') {
           modelLoading = true;
           console.log('[pipeline] Worker model loading');
