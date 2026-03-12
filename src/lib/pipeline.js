@@ -656,12 +656,32 @@ async function runWorkerPool({
     .map((item) => ordered.get(item.id))
     .filter(Boolean);
 
+  const errorSummaryMap = new Map();
+  for (const err of errors) {
+    const msg =
+      typeof err?.message === 'string' && err.message.trim().length > 0
+        ? err.message.trim()
+        : 'Unknown worker item error.';
+    errorSummaryMap.set(msg, (errorSummaryMap.get(msg) || 0) + 1);
+  }
+  const topErrorSummaries = [...errorSummaryMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([message, count]) => `${message} (${count})`);
+
   if (results.length === 0) {
+    if (topErrorSummaries.length > 0) {
+      throw new Error(
+        `No image embeddings were generated. Worker item failures: ${topErrorSummaries.join('; ')}.`
+      );
+    }
     throw new Error('No image embeddings were generated.');
   }
 
   if (errors.length > 0) {
-    console.warn(`Worker processing skipped ${errors.length} images due to errors.`);
+    console.warn(`Worker processing skipped ${errors.length} images due to errors.`, {
+      topErrors: topErrorSummaries,
+    });
   }
 
   console.log('[pipeline] Worker pool complete', {
@@ -752,18 +772,49 @@ export async function runArenaImagePipeline({
     });
   }
 
-  const newWorkerResults =
-    uncachedImages.length > 0
-      ? await runWorkerPool({
-          items: uncachedImages,
-          workerCount,
-          batchSize,
-          onProgress,
-          signal,
-          progressOffset: cachedWorkerResults.length,
-          progressTotal: images.length,
-        })
-      : [];
+  let newWorkerResults = [];
+  if (uncachedImages.length > 0) {
+    try {
+      newWorkerResults = await runWorkerPool({
+        items: uncachedImages,
+        workerCount,
+        batchSize,
+        onProgress,
+        signal,
+        progressOffset: cachedWorkerResults.length,
+        progressTotal: images.length,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const shouldRetrySingleWorker =
+        workerCount > 1 &&
+        (message.includes('No image embeddings were generated') ||
+          message.includes('Worker item failures'));
+
+      if (!shouldRetrySingleWorker) throw err;
+
+      console.warn('[pipeline] Retrying worker pool with single worker after embed failure', {
+        previousWorkerCount: workerCount,
+        reason: message,
+      });
+      onProgress?.({
+        stage: 'embed',
+        message: 'Retrying embedding generation with a single worker...',
+        completed: cachedWorkerResults.length,
+        total: images.length,
+        modelLoading: true,
+      });
+      newWorkerResults = await runWorkerPool({
+        items: uncachedImages,
+        workerCount: 1,
+        batchSize,
+        onProgress,
+        signal,
+        progressOffset: cachedWorkerResults.length,
+        progressTotal: images.length,
+      });
+    }
+  }
   const workerResults = [...cachedWorkerResults, ...newWorkerResults];
   setCachedChannelEmbeddings(cacheKey, workerResults);
   await writePersistentChannelEmbeddings(cacheKey, workerResults);
