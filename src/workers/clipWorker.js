@@ -1,8 +1,8 @@
-import { pipeline, env } from '@xenova/transformers';
-
 const MODEL_ID = 'Xenova/clip-vit-base-patch32';
+const TRANSFORMERS_CDN_URL = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 let extractorPromise = null;
 let modelStatusPosted = false;
+let transformersModulePromise = null;
 
 function getErrorMessage(errorLike) {
   if (errorLike instanceof Error) return errorLike.message;
@@ -45,6 +45,23 @@ async function getExtractor() {
       self.postMessage({ type: 'model_loading', modelId: MODEL_ID });
       modelStatusPosted = true;
     }
+    if (!transformersModulePromise) {
+      transformersModulePromise = (async () => {
+        try {
+          // Works in local dev where the bare specifier can be resolved by the dev server.
+          return await import('@xenova/transformers');
+        } catch (firstError) {
+          console.warn('[worker] Local transformers import failed, falling back to CDN', {
+            error: getErrorMessage(firstError),
+            cdnUrl: TRANSFORMERS_CDN_URL,
+          });
+          // Works in production where worker bundles may preserve bare specifiers.
+          return import(TRANSFORMERS_CDN_URL);
+        }
+      })();
+    }
+
+    const { pipeline, env } = await transformersModulePromise;
     env.allowLocalModels = false;
     env.useBrowserCache = true;
     console.log('[worker] Loading CLIP model', MODEL_ID);
