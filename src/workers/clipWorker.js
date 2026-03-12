@@ -1,7 +1,8 @@
+import { pipeline, env } from '@xenova/transformers';
+
 const MODEL_ID = 'Xenova/clip-vit-base-patch32';
 let extractorPromise = null;
 let modelStatusPosted = false;
-let transformersModulePromise = null;
 
 function getErrorMessage(errorLike) {
   if (errorLike instanceof Error) return errorLike.message;
@@ -38,20 +39,12 @@ self.addEventListener('unhandledrejection', (event) => {
   });
 });
 
-async function getTransformersModule() {
-  if (!transformersModulePromise) {
-    transformersModulePromise = import('@xenova/transformers');
-  }
-  return transformersModulePromise;
-}
-
 async function getExtractor() {
   if (!extractorPromise) {
     if (!modelStatusPosted) {
       self.postMessage({ type: 'model_loading', modelId: MODEL_ID });
       modelStatusPosted = true;
     }
-    const { pipeline, env } = await getTransformersModule();
     env.allowLocalModels = false;
     env.useBrowserCache = true;
     console.log('[worker] Loading CLIP model', MODEL_ID);
