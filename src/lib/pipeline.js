@@ -435,6 +435,54 @@ function normalizeEmbeddingVector(rawEmbedding, expectedLength) {
   return normalized;
 }
 
+function describeWorkerErrorEvent(event) {
+  const directMessage =
+    typeof event?.message === 'string' && event.message.trim().length > 0
+      ? event.message.trim()
+      : null;
+  const nestedErrorMessage =
+    typeof event?.error?.message === 'string' && event.error.message.trim().length > 0
+      ? event.error.message.trim()
+      : null;
+  const fileHint =
+    typeof event?.filename === 'string' && event.filename.trim().length > 0
+      ? event.filename.split('/').pop()
+      : null;
+  const lineHint = Number.isFinite(event?.lineno) && event.lineno > 0 ? event.lineno : null;
+  const columnHint = Number.isFinite(event?.colno) && event.colno > 0 ? event.colno : null;
+  const locationHint =
+    fileHint && lineHint != null
+      ? `${fileHint}:${lineHint}${columnHint != null ? `:${columnHint}` : ''}`
+      : fileHint;
+  const fallbackDetails =
+    typeof event?.data === 'string' && event.data.trim().length > 0 ? event.data.trim() : null;
+
+  const message =
+    directMessage ||
+    nestedErrorMessage ||
+    fallbackDetails ||
+    (locationHint ? `Worker runtime error at ${locationHint}` : null) ||
+    'Unknown worker runtime error.';
+
+  return {
+    message,
+    locationHint,
+    stack: typeof event?.error?.stack === 'string' ? event.error.stack : null,
+  };
+}
+
+function buildWorkerFailureMessage(info, workerUrl) {
+  const base = info?.message || 'Unknown worker runtime error.';
+  const likelyStartupFailure =
+    base === 'Unknown worker runtime error.' || base.startsWith('Worker runtime error at ');
+
+  if (!likelyStartupFailure) {
+    return `Worker error: ${base}`;
+  }
+
+  return `Worker failed to initialize: ${base} This is often caused by blocked worker/module requests in production (CSP, ad blockers, or cross-origin asset paths). Worker URL: ${workerUrl}`;
+}
+
 async function runWorkerPool({
   items,
   workerCount,
@@ -486,12 +534,24 @@ async function runWorkerPool({
     workers.push(worker);
 
     await new Promise((resolve, reject) => {
+      const startupTimeoutMs = 15000;
+      const startupTimeout = setTimeout(() => {
+        reject(
+          new Error(
+            `Worker failed to initialize within ${startupTimeoutMs}ms. This is often caused by blocked worker/module requests in production (CSP, ad blockers, or cross-origin asset paths). Worker URL: ${workerUrl.href}`
+          )
+        );
+      }, startupTimeoutMs);
+      const clearStartupTimeout = () => clearTimeout(startupTimeout);
+
       const assignNext = () => {
         if (signal?.aborted) {
+          clearStartupTimeout();
           reject(new Error('Pipeline cancelled.'));
           return;
         }
         if (nextBatchIndex >= batches.length) {
+          clearStartupTimeout();
           resolve();
           return;
         }
@@ -509,6 +569,7 @@ async function runWorkerPool({
       };
 
       worker.onmessage = (event) => {
+        clearStartupTimeout();
         const msg = event.data;
         if (msg?.type === 'model_loading') {
           modelLoading = true;
@@ -542,8 +603,22 @@ async function runWorkerPool({
       };
 
       worker.onerror = (event) => {
-        console.error('[pipeline] Worker error event', event);
-        reject(new Error(`Worker error: ${event.message}`));
+        const info = describeWorkerErrorEvent(event);
+        console.error('[pipeline] Worker error event', {
+          message: info.message,
+          location: info.locationHint,
+          stack: info.stack,
+          workerUrl: workerUrl.href,
+          rawEvent: event,
+        });
+        clearStartupTimeout();
+        reject(new Error(buildWorkerFailureMessage(info, workerUrl.href)));
+      };
+
+      worker.onmessageerror = (event) => {
+        console.error('[pipeline] Worker message parse error', event);
+        clearStartupTimeout();
+        reject(new Error('Worker message error: failed to parse worker response payload.'));
       };
 
       assignNext();
