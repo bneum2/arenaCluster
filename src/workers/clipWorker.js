@@ -65,7 +65,27 @@ async function getExtractor() {
     env.allowLocalModels = false;
     env.useBrowserCache = true;
     console.log('[worker] Loading CLIP model', MODEL_ID);
-    extractorPromise = pipeline('image-feature-extraction', MODEL_ID);
+    extractorPromise = pipeline('image-feature-extraction', MODEL_ID, {
+      progress_callback: (progress) => {
+        self.postMessage({
+          type: 'model_download_progress',
+          status: typeof progress?.status === 'string' ? progress.status : null,
+          file: typeof progress?.file === 'string' ? progress.file : null,
+          loaded:
+            typeof progress?.loaded === 'number' && Number.isFinite(progress.loaded)
+              ? progress.loaded
+              : null,
+          total:
+            typeof progress?.total === 'number' && Number.isFinite(progress.total)
+              ? progress.total
+              : null,
+          progress:
+            typeof progress?.progress === 'number' && Number.isFinite(progress.progress)
+              ? progress.progress
+              : null,
+        });
+      },
+    });
     await extractorPromise;
     console.log('[worker] CLIP model loaded');
     self.postMessage({ type: 'model_loaded', modelId: MODEL_ID });
@@ -93,15 +113,14 @@ function meanColor(points) {
   return [acc[0] / points.length, acc[1] / points.length, acc[2] / points.length];
 }
 
-function kMeansRGB(pixels, k = 3, iterations = 12) {
+function kMeansRGB(pixels, k = 2, iterations = 12) {
   if (pixels.length === 0) {
     return {
       dominantColors: [
         [0, 0, 0],
         [0, 0, 0],
-        [0, 0, 0],
       ],
-      colorVector: new Array(9).fill(0),
+      colorVector: new Array(6).fill(0),
     };
   }
 
@@ -144,7 +163,7 @@ function kMeansRGB(pixels, k = 3, iterations = 12) {
   const dominantColors = ordered.map((idx) =>
     centroids[idx].map((v) => Math.max(0, Math.min(255, Math.round(v))))
   );
-  while (dominantColors.length < 3) dominantColors.push([0, 0, 0]);
+  while (dominantColors.length < 2) dominantColors.push([0, 0, 0]);
 
   const colorVector = dominantColors
     .flat()
@@ -173,7 +192,7 @@ async function extractDominantColors(imageUrl) {
     if (alpha < 16) continue;
     pixels.push([imageData[i], imageData[i + 1], imageData[i + 2]]);
   }
-  return kMeansRGB(pixels, 3, 12);
+  return kMeansRGB(pixels, 2, 12);
 }
 
 function normalizeEmbedding(raw) {
@@ -212,7 +231,20 @@ async function processItem(item) {
 
 self.onmessage = async (event) => {
   const payload = event.data;
-  if (!payload || payload.type !== 'process_batch') return;
+  if (!payload) return;
+
+  if (payload.type === 'warmup_model') {
+    try {
+      await getExtractor();
+      self.postMessage({ type: 'warmup_complete', modelId: MODEL_ID });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      postFatalError('Worker warmup failed', { message });
+    }
+    return;
+  }
+
+  if (payload.type !== 'process_batch') return;
 
   const { batchId, items } = payload;
   console.log('[worker] Processing batch', { batchId, size: items.length });

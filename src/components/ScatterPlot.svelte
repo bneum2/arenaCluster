@@ -42,19 +42,18 @@
   let minimapIntentWorldY = null;
   let minimapIntentActiveUntilMs = 0;
 
-  const BASE_CONCURRENT_IMAGE_LOADS = 6;
-  const LARGE_DATASET_MAX_CONCURRENT_IMAGE_LOADS = 10;
-  const VERY_LARGE_DATASET_MAX_CONCURRENT_IMAGE_LOADS = 18;
-  const MAX_IMAGE_ENQUEUES_PER_FRAME = 90;
-  const FIRST_PAINT_MAX_IMAGE_ENQUEUES_PER_FRAME = 170;
+  const BASE_CONCURRENT_IMAGE_LOADS = 20;
+  const LARGE_DATASET_MAX_CONCURRENT_IMAGE_LOADS = 32;
+  const VERY_LARGE_DATASET_MAX_CONCURRENT_IMAGE_LOADS = 48;
+  const MAX_IMAGE_ENQUEUES_PER_FRAME = 220;
+  const FIRST_PAINT_MAX_IMAGE_ENQUEUES_PER_FRAME = 420;
   const FIRST_PAINT_DURATION_MS = 1800;
-  const CAMERA_PRIORITY_PRELOAD_COUNT = 220;
-  const FIRST_PAINT_PRIORITY_PRELOAD_COUNT = 340;
+  const CAMERA_PRIORITY_PRELOAD_COUNT = 500;
+  const FIRST_PAINT_PRIORITY_PRELOAD_COUNT = 900;
   const OUTER_RING_OVERSCAN_MULTIPLIER = 2.4;
-  const OUTER_RING_PREFETCH_COUNT = 240;
-  const MINIMAP_INTENT_PREFETCH_COUNT = 200;
+  const OUTER_RING_PREFETCH_COUNT = 500;
+  const MINIMAP_INTENT_PREFETCH_COUNT = 350;
   const MINIMAP_INTENT_HOLD_MS = 1600;
-  const IMAGE_FADE_MS = 220;
   const POSITION_SMOOTHING = 14;
   const POSITION_SETTLE_EPSILON = 0.35;
   const LARGE_DATASET_POINT_THRESHOLD = 2000;
@@ -68,8 +67,10 @@
   const MIN_ZOOM = 1;
   const MAX_ZOOM = 6;
   const HIGH_RES_SOURCE_SWITCH_PX = 72;
+  const EAGER_PRELOAD_HIGH_PRIORITY_COUNT = 700;
   let minimapWidth = 180;
   let minimapHeight = 120;
+  let lastEagerQueuedPointCount = 0;
 
   function getContainedSpriteSize(img) {
     const width = img?.naturalWidth || img?.width || 1;
@@ -215,6 +216,10 @@
     return BASE_CONCURRENT_IMAGE_LOADS;
   }
 
+  function shouldAllowHighResUpgrades() {
+    return loadQueue.length === 0 && activeImageLoads === 0;
+  }
+
   function pumpImageQueue() {
     while (activeImageLoads < getMaxConcurrentImageLoads() && loadQueue.length > 0) {
       const nextUrl = loadQueue.shift();
@@ -253,6 +258,23 @@
       !entry.failed &&
       (entry.loading || entry.queued);
     return { entry, queuedNow };
+  }
+
+  function eagerQueueAllThumbs() {
+    if (points.length === 0 || points.length === lastEagerQueuedPointCount) return;
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      if (!point?.revealed) continue;
+      const thumbUrl = point.thumbUrl || point.originalUrl;
+      if (!thumbUrl) continue;
+      requestImage(
+        thumbUrl,
+        true,
+        index < EAGER_PRELOAD_HIGH_PRIORITY_COUNT ? 'high' : 'normal'
+      );
+    }
+    lastEagerQueuedPointCount = points.length;
+    startFrameLoop();
   }
 
   function sortVisibleIdsByCameraDistance(ids) {
@@ -415,7 +437,10 @@
     const visibleIds = getVisiblePointIds(worldMinX, worldMaxX, worldMinY, worldMaxY);
     const prioritizedIds = sortVisibleIdsByCameraDistance(visibleIds);
     const firstPaintMode = shouldUseFirstPaintMode(nowMs);
-    const shouldPreferHighRes = !firstPaintMode && spriteSize * zoom >= HIGH_RES_SOURCE_SWITCH_PX;
+    const shouldPreferHighRes =
+      !firstPaintMode &&
+      spriteSize * zoom >= HIGH_RES_SOURCE_SWITCH_PX &&
+      shouldAllowHighResUpgrades();
     let enqueueBudget = firstPaintMode
       ? FIRST_PAINT_MAX_IMAGE_ENQUEUES_PER_FRAME
       : MAX_IMAGE_ENQUEUES_PER_FRAME;
@@ -431,28 +456,27 @@
       if (!motion) continue;
       const requestPriority = index < viewportPriorityCount ? 'high' : 'normal';
 
-      const preferredUrl =
-        shouldPreferHighRes && sourcePoint.originalUrl ? sourcePoint.originalUrl : sourcePoint.thumbUrl;
-      const fallbackUrl = preferredUrl === sourcePoint.originalUrl ? sourcePoint.thumbUrl : null;
-      const preferredRequest = requestImage(preferredUrl, enqueueBudget > 0, requestPriority);
-      if (preferredRequest.queuedNow) enqueueBudget -= 1;
-      const preferredEntry = preferredRequest.entry;
-      const fallbackRequest =
-        fallbackUrl && !preferredEntry?.loaded
-          ? requestImage(fallbackUrl, enqueueBudget > 0, requestPriority)
-          : null;
-      if (fallbackRequest?.queuedNow) enqueueBudget -= 1;
-      const fallbackEntry = fallbackRequest?.entry ?? null;
-      const entry =
-        preferredEntry?.loaded ? preferredEntry : fallbackEntry?.loaded ? fallbackEntry : preferredEntry;
+      const displayUrl = sourcePoint.thumbUrl || sourcePoint.originalUrl;
+      const displayRequest = requestImage(displayUrl, enqueueBudget > 0, requestPriority);
+      if (displayRequest.queuedNow) enqueueBudget -= 1;
+      const displayEntry = displayRequest.entry;
+      let entry = displayEntry;
+
+      const shouldRequestHighRes =
+        shouldPreferHighRes &&
+        !!sourcePoint.originalUrl &&
+        sourcePoint.originalUrl !== displayUrl;
+      if (shouldRequestHighRes) {
+        const highResRequest = requestImage(sourcePoint.originalUrl, enqueueBudget > 0, requestPriority);
+        if (highResRequest.queuedNow) enqueueBudget -= 1;
+        if (highResRequest.entry?.loaded) {
+          entry = highResRequest.entry;
+        }
+      }
 
       if (entry?.loaded) {
-        const alpha = shouldAnimateFades()
-          ? Math.min(1, Math.max(0, nowMs - entry.loadedAt) / IMAGE_FADE_MS)
-          : 1;
         const drawWidth = entry.drawWidth || spriteSize;
         const drawHeight = entry.drawHeight || spriteSize;
-        ctx.globalAlpha = alpha;
         ctx.drawImage(
           entry.img,
           motion.x - drawWidth / 2,
@@ -460,12 +484,6 @@
           drawWidth,
           drawHeight
         );
-        ctx.globalAlpha = 1;
-      } else {
-        ctx.fillStyle = '#ccc';
-        ctx.beginPath();
-        ctx.arc(motion.x, motion.y, Math.max(3, spriteSize * 0.18), 0, Math.PI * 2);
-        ctx.fill();
       }
     }
 
@@ -611,19 +629,6 @@
     return ids;
   }
 
-  function hasActiveImageFades(nowMs = performance.now()) {
-    if (!shouldAnimateFades()) return false;
-    for (const entry of imageByUrl.values()) {
-      if (!entry.loaded) continue;
-      if (nowMs - entry.loadedAt < IMAGE_FADE_MS) return true;
-    }
-    return false;
-  }
-
-  function shouldAnimateFades() {
-    return points.length < CRITICAL_POINT_THRESHOLD;
-  }
-
   function getTargetFrameIntervalMs() {
     if (points.length >= VERY_LARGE_POINT_THRESHOLD) {
       return isLoading ? 100 : 50;
@@ -658,7 +663,7 @@
     if (moving) refreshRenderedPoints();
     draw(nowMs);
 
-    const keepRunning = moving || hasActiveImageFades(nowMs);
+    const keepRunning = moving;
     if (keepRunning) {
       scheduleDrawFrame();
     } else {
@@ -892,6 +897,7 @@
       previousPointCount = 0;
       hadLargeDataset = false;
       minimapIntentActiveUntilMs = 0;
+      lastEagerQueuedPointCount = 0;
     } else {
       const isLargeDataset = points.length >= CRITICAL_POINT_THRESHOLD;
       if (previousPointCount === 0 || (!hadLargeDataset && isLargeDataset)) {
@@ -900,6 +906,7 @@
       previousPointCount = points.length;
       hadLargeDataset = isLargeDataset;
     }
+    eagerQueueAllThumbs();
     refreshCachedSpriteSizes();
     syncMotionTargets();
     startFrameLoop();

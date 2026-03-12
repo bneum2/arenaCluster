@@ -483,6 +483,118 @@ function buildWorkerFailureMessage(info, workerUrl) {
   return `Worker failed to initialize: ${base} This is often caused by blocked worker/module requests in production (CSP, ad blockers, or cross-origin asset paths). Worker URL: ${workerUrl}`;
 }
 
+function toWorkerModelProgress(msg) {
+  const total =
+    typeof msg?.total === 'number' && Number.isFinite(msg.total) && msg.total > 0 ? msg.total : null;
+  const loaded =
+    typeof msg?.loaded === 'number' && Number.isFinite(msg.loaded) && msg.loaded >= 0 ? msg.loaded : null;
+  const percent =
+    typeof msg?.progress === 'number' && Number.isFinite(msg.progress)
+      ? Math.max(
+          0,
+          Math.min(100, Math.round(msg.progress <= 1 ? msg.progress * 100 : msg.progress))
+        )
+      : total && loaded != null
+        ? Math.max(0, Math.min(100, Math.round((loaded / total) * 100)))
+        : null;
+  const status = typeof msg?.status === 'string' ? msg.status : null;
+  const file = typeof msg?.file === 'string' ? msg.file : null;
+  return { total, loaded, percent, status, file };
+}
+
+let clipWarmupPromise = null;
+
+export function preloadClipModel({ onProgress } = {}) {
+  if (clipWarmupPromise) return clipWarmupPromise;
+
+  const workerUrl = new URL('../workers/clipWorker.js', import.meta.url);
+  clipWarmupPromise = new Promise((resolve, reject) => {
+    const worker = new Worker(workerUrl, { type: 'module' });
+    let finished = false;
+    const startedAt = Date.now();
+
+    function finalize(callback) {
+      if (finished) return;
+      finished = true;
+      worker.terminate();
+      callback();
+    }
+
+    worker.onmessage = (event) => {
+      const msg = event.data;
+      if (!msg) return;
+
+      if (msg.type === 'model_download_progress') {
+        const modelProgress = toWorkerModelProgress(msg);
+        onProgress?.({
+          stage: 'model_download',
+          message: 'Downloading CLIP model...',
+          modelLoading: true,
+          modelDownloadLoaded: modelProgress.loaded,
+          modelDownloadTotal: modelProgress.total,
+          modelDownloadPercent: modelProgress.percent,
+          modelDownloadStatus: modelProgress.status,
+          modelDownloadFile: modelProgress.file,
+        });
+        return;
+      }
+
+      if (msg.type === 'model_loading') {
+        onProgress?.({
+          stage: 'model_download',
+          message: 'Preparing CLIP model download...',
+          modelLoading: true,
+        });
+        return;
+      }
+
+      if (msg.type === 'model_loaded' || msg.type === 'warmup_complete') {
+        finalize(() => {
+          onProgress?.({
+            stage: 'model_ready',
+            message: 'CLIP model ready.',
+            modelLoading: false,
+            modelDownloadPercent: 100,
+          });
+          console.log('[pipeline] CLIP warmup complete', {
+            runtimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+          });
+          resolve();
+        });
+        return;
+      }
+
+      if (msg.type === 'worker_fatal') {
+        const detailMessage =
+          typeof msg?.details?.message === 'string' && msg.details.message.trim().length > 0
+            ? msg.details.message.trim()
+            : null;
+        const reason = detailMessage || msg.message || 'Unknown worker warmup error.';
+        finalize(() => reject(new Error(`CLIP warmup failed: ${reason}`)));
+      }
+    };
+
+    worker.onerror = (event) => {
+      const info = describeWorkerErrorEvent(event);
+      finalize(() => reject(new Error(buildWorkerFailureMessage(info, workerUrl.href))));
+    };
+
+    worker.onmessageerror = () => {
+      finalize(() =>
+        reject(new Error('Worker message error: failed to parse warmup worker response payload.'))
+      );
+    };
+
+    worker.postMessage({ type: 'warmup_model' });
+  }).catch((err) => {
+    // Allow retrying warmup if an early attempt fails.
+    clipWarmupPromise = null;
+    throw err;
+  });
+
+  return clipWarmupPromise;
+}
+
 async function runWorkerPool({
   items,
   workerCount,
@@ -591,6 +703,24 @@ async function runWorkerPool({
           modelLoading = true;
           console.log('[pipeline] Worker model loading');
           updateProgress();
+          return;
+        }
+        if (msg?.type === 'model_download_progress') {
+          const modelProgress = toWorkerModelProgress(msg);
+          modelLoading = true;
+          onProgress?.({
+            stage: 'embed',
+            message: `Generating embeddings... (${Math.min(progressTotal, progressOffset + finishedCount)} / ${progressTotal}) Downloading CLIP model cache...`,
+            completed: Math.min(progressTotal, progressOffset + finishedCount),
+            total: progressTotal,
+            etaSeconds: estimateEta(startedAt, Math.min(progressTotal, progressOffset + finishedCount), progressTotal),
+            modelLoading: true,
+            modelDownloadLoaded: modelProgress.loaded,
+            modelDownloadTotal: modelProgress.total,
+            modelDownloadPercent: modelProgress.percent,
+            modelDownloadStatus: modelProgress.status,
+            modelDownloadFile: modelProgress.file,
+          });
           return;
         }
         if (msg?.type === 'model_loaded') {
@@ -835,7 +965,10 @@ export async function runArenaImagePipeline({
   const clipEmbeddings = successfulImages.map((item) =>
     normalizeEmbeddingVector(byId.get(item.id).embedding, embeddingLength)
   );
-  const colorVectors = successfulImages.map((item) => byId.get(item.id).colorVector);
+  const colorVectorLength = 6;
+  const colorVectors = successfulImages.map((item) =>
+    normalizeEmbeddingVector(byId.get(item.id).colorVector, colorVectorLength)
+  );
 
   onProgress?.({ stage: 'pca', message: 'Running PCA...' });
   console.log('[pipeline] PCA start', { vectors: clipEmbeddings.length, dims: embeddingLength });

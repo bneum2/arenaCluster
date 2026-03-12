@@ -1,5 +1,15 @@
 <script>
   export let pipelineProgress;
+  export let clipPreloadProgress = {
+    active: false,
+    message: '',
+    loaded: null,
+    total: null,
+    percent: null,
+    status: null,
+    file: null,
+    ready: false,
+  };
   export let progressPercent = 0;
   export let elapsedSeconds = 0;
   export let etaText = 'Estimating...';
@@ -17,8 +27,25 @@
     <div class="progress-fill" style={`width:${progressPercent}%`}></div>
   </div>
   <p class="loading-sub">{etaText} - elapsed {elapsedSeconds}s</p>
-  {#if pipelineProgress.modelLoading}
-    <p class="loading-sub">Downloading CLIP model for first run...</p>
+  {#if pipelineProgress.modelLoading || clipPreloadProgress.active}
+    <p class="loading-sub">
+      {clipPreloadProgress.message || 'Downloading CLIP model for first run...'}
+    </p>
+    <div class="progress-bar model-progress">
+      <div
+        class="progress-fill model-progress-fill"
+        style={`width:${Math.max(0, Math.min(100, clipPreloadProgress.percent ?? pipelineProgress.modelDownloadPercent ?? 0))}%`}
+      ></div>
+    </div>
+    {#if Number.isFinite(clipPreloadProgress.total ?? pipelineProgress.modelDownloadTotal)}
+      <p class="loading-sub">
+        {Math.round(clipPreloadProgress.percent ?? pipelineProgress.modelDownloadPercent ?? 0)}%
+        ({(clipPreloadProgress.loaded ?? pipelineProgress.modelDownloadLoaded ?? 0).toLocaleString()} /
+        {(clipPreloadProgress.total ?? pipelineProgress.modelDownloadTotal ?? 0).toLocaleString()} bytes)
+      </p>
+    {:else if clipPreloadProgress.status || pipelineProgress.modelDownloadStatus}
+      <p class="loading-sub">{clipPreloadProgress.status || pipelineProgress.modelDownloadStatus}</p>
+    {/if}
   {/if}
 </div>
 
@@ -61,5 +88,14 @@
     height: 100%;
     background: #222;
     transition: width 0.15s linear;
+  }
+
+  .model-progress {
+    height: 8px;
+    margin-top: 0.35rem;
+  }
+
+  .model-progress-fill {
+    background: #4a4a4a;
   }
 </style>

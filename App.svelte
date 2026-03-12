@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { parseArenaSlug, runArenaImagePipeline } from './src/lib/pipeline.js';
+  import { parseArenaSlug, preloadClipModel, runArenaImagePipeline } from './src/lib/pipeline.js';
   import EntryScreen from './src/components/EntryScreen.svelte';
   import LoadingOverlay from './src/components/LoadingOverlay.svelte';
   import ErrorView from './src/components/ErrorView.svelte';
@@ -26,6 +26,21 @@
     total: 0,
     etaSeconds: null,
     modelLoading: false,
+    modelDownloadLoaded: null,
+    modelDownloadTotal: null,
+    modelDownloadPercent: null,
+    modelDownloadStatus: null,
+    modelDownloadFile: null,
+  };
+  let clipPreloadProgress = {
+    active: false,
+    message: '',
+    loaded: null,
+    total: null,
+    percent: null,
+    status: null,
+    file: null,
+    ready: false,
   };
 
   let currentRunId = 0;
@@ -33,9 +48,6 @@
   let runStartedAt = 0;
   let elapsedTick = Date.now();
   let elapsedTimerHandle = null;
-  let revealFlushHandle = null;
-  let pendingRevealIds = new Set();
-  let staggerCounter = 0;
   const BASE_IMAGE_PADDING = 2;
   const PLOT_MARGIN_RATIO = 0.1;
   const LOADING_OVERSCAN_SCALE = 1.08;
@@ -193,7 +205,11 @@
   $: plotScale = Math.max(loading ? LOADING_OVERSCAN_SCALE : 1, datasetScale);
   $: plotWidth = Math.round(viewportWidth * plotScale);
   $: plotHeight = Math.round(viewportHeight * plotScale);
-  $: spriteSize = computeSpriteSize(positionedImages.length, plotWidth, plotHeight);
+  $: spriteSizingCount =
+    loading && pipelineProgress.stage === 'fetch' && Number.isFinite(pipelineProgress.total)
+      ? Math.max(positionedImages.length, pipelineProgress.total)
+      : positionedImages.length;
+  $: spriteSize = computeSpriteSize(spriteSizingCount, plotWidth, plotHeight);
   $: shouldResolveCollisions = !loading && positionedImages.length > 0;
   $: collisionFreePixels = shouldResolveCollisions
     ? buildCollisionFreeMap(positionedImages, plotWidth, plotHeight, spriteSize)
@@ -212,29 +228,6 @@
     return -overscanRatio + Math.random() * (1 + overscanRatio * 2);
   }
 
-  function flushReveals(runId) {
-    revealFlushHandle = null;
-    if (runId !== currentRunId || pendingRevealIds.size === 0) {
-      pendingRevealIds.clear();
-      return;
-    }
-
-    const revealIds = pendingRevealIds;
-    pendingRevealIds = new Set();
-    positionedImages = positionedImages.map((item) =>
-      revealIds.has(item.id) ? { ...item, revealed: true } : item
-    );
-  }
-
-  function revealImageLater(runId, id, delayMs) {
-    setTimeout(() => {
-      if (runId !== currentRunId) return;
-      pendingRevealIds.add(id);
-      if (revealFlushHandle) return;
-      revealFlushHandle = setTimeout(() => flushReveals(runId), 70);
-    }, delayMs);
-  }
-
   function appendFetchedImages(runId, batch) {
     if (runId !== currentRunId || !Array.isArray(batch) || batch.length === 0) return;
     const existingIds = new Set(positionedImages.map((item) => item.id));
@@ -242,8 +235,6 @@
 
     for (const item of batch) {
       if (existingIds.has(item.id)) continue;
-      const revealDelayMs = Math.min(1800, staggerCounter * 45);
-      staggerCounter += 1;
       next.push({
         id: item.id,
         thumbUrl: item.thumbUrl,
@@ -255,10 +246,8 @@
         dominantColors: [],
         x: randomCoord(FETCH_SPAWN_OVERSCAN_RATIO),
         y: randomCoord(FETCH_SPAWN_OVERSCAN_RATIO),
-        revealDelayMs,
-        revealed: false,
+        revealed: true,
       });
-      revealImageLater(runId, item.id, revealDelayMs);
     }
 
     if (next.length > 0) {
@@ -303,14 +292,8 @@
     channelSlug = slug;
     hoveredBlock = null;
     positionedImages = [];
-    pendingRevealIds.clear();
-    if (revealFlushHandle) {
-      clearTimeout(revealFlushHandle);
-      revealFlushHandle = null;
-    }
     error = '';
     loading = true;
-    staggerCounter = 0;
     pipelineProgress = {
       stage: 'fetch',
       message: 'Fetching channel blocks...',
@@ -318,6 +301,11 @@
       total: 0,
       etaSeconds: null,
       modelLoading: false,
+      modelDownloadLoaded: null,
+      modelDownloadTotal: null,
+      modelDownloadPercent: null,
+      modelDownloadStatus: null,
+      modelDownloadFile: null,
     };
   }
 
@@ -405,11 +393,44 @@
     };
     handleResize();
     window.addEventListener('resize', handleResize);
+
+    preloadClipModel({
+      onProgress: (progress) => {
+        const active = progress?.stage === 'model_download' || progress?.modelLoading;
+        clipPreloadProgress = {
+          active: Boolean(active),
+          message: progress?.message || '',
+          loaded:
+            typeof progress?.modelDownloadLoaded === 'number' ? progress.modelDownloadLoaded : null,
+          total: typeof progress?.modelDownloadTotal === 'number' ? progress.modelDownloadTotal : null,
+          percent:
+            typeof progress?.modelDownloadPercent === 'number'
+              ? progress.modelDownloadPercent
+              : progress?.stage === 'model_ready'
+                ? 100
+                : null,
+          status: typeof progress?.modelDownloadStatus === 'string' ? progress.modelDownloadStatus : null,
+          file: typeof progress?.modelDownloadFile === 'string' ? progress.modelDownloadFile : null,
+          ready: progress?.stage === 'model_ready',
+        };
+      },
+    }).catch((err) => {
+      console.warn('[app] CLIP warmup failed', err);
+      clipPreloadProgress = {
+        active: false,
+        message: '',
+        loaded: null,
+        total: null,
+        percent: null,
+        status: null,
+        file: null,
+        ready: false,
+      };
+    });
+
     return () => {
       window.removeEventListener('resize', handleResize);
       if (currentAbortController) currentAbortController.abort();
-      if (revealFlushHandle) clearTimeout(revealFlushHandle);
-      pendingRevealIds.clear();
       stopElapsedTimer();
     };
   });
@@ -439,6 +460,7 @@
     {#if loading}
       <LoadingOverlay
         pipelineProgress={pipelineProgress}
+        clipPreloadProgress={clipPreloadProgress}
         progressPercent={progressPercent}
         elapsedSeconds={elapsedSeconds}
         etaText={formatEta(pipelineProgress.etaSeconds)}
