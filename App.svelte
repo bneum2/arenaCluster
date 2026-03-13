@@ -17,6 +17,8 @@
   /** One slot per corner: [top-left, top-right, bottom-right]. Bottom-left = minimap. */
   let selectedBlocks = [null, null, null];
   let positionedImages = [];
+  /** 'scatter' = current free layout; 'cluster' = grouped in rotating circles */
+  let viewMode = 'scatter';
 
   let viewportWidth = 1200;
   let viewportHeight = 800;
@@ -212,19 +214,162 @@
       ? Math.max(positionedImages.length, pipelineProgress.total)
       : positionedImages.length;
   $: spriteSize = computeSpriteSize(spriteSizingCount, plotWidth, plotHeight);
-  $: shouldResolveCollisions = !loading && positionedImages.length > 0;
+  $: shouldResolveCollisions = !loading && positionedImages.length > 0 && viewMode === 'scatter';
   $: collisionFreePixels = shouldResolveCollisions
     ? buildCollisionFreeMap(positionedImages, plotWidth, plotHeight, spriteSize)
     : new Map();
-  $: imagePoints = positionedImages.map((item) => {
-    const point =
-      collisionFreePixels.get(item.id) || toPixelPoint(item, plotWidth, plotHeight, !loading);
-    return {
-      ...item,
-      px: point.px,
-      py: point.py,
-    };
-  });
+
+  // K-means for cluster view: 2D on (x, y)
+  function simpleKMeans2D(items, k, maxIterations = 50) {
+    if (!items.length || k < 1) return { clusters: [], centroids: [] };
+    const n = items.length;
+    const data = items.map((item) => [item.x, item.y]);
+    let centroids = [];
+    for (let i = 0; i < k; i++) {
+      const idx = Math.floor(Math.random() * n);
+      centroids.push([data[idx][0], data[idx][1]]);
+    }
+    let clusters = new Array(n).fill(0);
+    for (let iter = 0; iter < maxIterations; iter++) {
+      let changed = false;
+      for (let i = 0; i < n; i++) {
+        let best = 0;
+        let bestD = Infinity;
+        for (let j = 0; j < k; j++) {
+          const dx = data[i][0] - centroids[j][0];
+          const dy = data[i][1] - centroids[j][1];
+          const d = dx * dx + dy * dy;
+          if (d < bestD) {
+            bestD = d;
+            best = j;
+          }
+        }
+        if (clusters[i] !== best) {
+          clusters[i] = best;
+          changed = true;
+        }
+      }
+      if (!changed) break;
+      const sums = Array.from({ length: k }, () => [0, 0, 0]);
+      for (let i = 0; i < n; i++) {
+        const c = clusters[i];
+        sums[c][0] += data[i][0];
+        sums[c][1] += data[i][1];
+        sums[c][2] += 1;
+      }
+      for (let j = 0; j < k; j++) {
+        const count = sums[j][2] || 1;
+        centroids[j] = [sums[j][0] / count, sums[j][1] / count];
+      }
+    }
+    return { clusters, centroids };
+  }
+
+  const CLUSTER_RING_RADIUS = 155;
+  const CLUSTER_CENTER_SPREAD = 1.4;
+  const CLUSTER_MIN_COUNT = 3;
+  const CLUSTER_MAX_COUNT = 12;
+
+  $: clusterLayout =
+    viewMode === 'cluster' && positionedImages.length >= CLUSTER_MIN_COUNT
+      ? (() => {
+          const k = Math.min(
+            CLUSTER_MAX_COUNT,
+            Math.max(2, Math.floor(Math.sqrt(positionedImages.length / 2)))
+          );
+          const { clusters, centroids } = simpleKMeans2D(positionedImages, k);
+          const byCluster = new Map();
+          for (let i = 0; i < positionedImages.length; i++) {
+            const c = clusters[i];
+            if (!byCluster.has(c)) byCluster.set(c, []);
+            byCluster.get(c).push({ index: i, item: positionedImages[i] });
+          }
+          // Initial centers: near centroids are pushed outward, far ones stay compact.
+          const centers = centroids.map(([cx, cy], idx) => {
+            let nearest = Infinity;
+            for (let j = 0; j < centroids.length; j++) {
+              if (j === idx) continue;
+              const [nx, ny] = centroids[j];
+              const dx = cx - nx;
+              const dy = cy - ny;
+              const d = Math.hypot(dx, dy);
+              if (d < nearest) nearest = d;
+            }
+            const NEAR_THRESHOLD = 0.25; // normalized distance; below this = \"too close\"
+            const isNear = Number.isFinite(nearest) && nearest < NEAR_THRESHOLD;
+            if (isNear) {
+              return {
+                x: (cx - 0.5) * plotWidth * CLUSTER_CENTER_SPREAD + plotWidth * 0.5,
+                y: (cy - 0.5) * plotHeight * CLUSTER_CENTER_SPREAD + plotHeight * 0.5,
+              };
+            }
+            return {
+              x: cx * plotWidth * 0.8 + plotWidth * PLOT_MARGIN_RATIO,
+              y: cy * plotHeight * 0.8 + plotHeight * PLOT_MARGIN_RATIO,
+            };
+          });
+
+          // Resolve any remaining overlaps between cluster circles by gently
+          // pushing overlapping centers apart. Far-apart clusters barely move.
+          const MIN_CENTER_DISTANCE = CLUSTER_RING_RADIUS * 2 + 40; // diameter + margin
+          const MAX_RELAX_ITERATIONS = 18;
+          for (let iter = 0; iter < MAX_RELAX_ITERATIONS; iter++) {
+            let anyOverlap = false;
+            for (let i = 0; i < centers.length; i++) {
+              for (let j = i + 1; j < centers.length; j++) {
+                const a = centers[i];
+                const b = centers[j];
+                let dx = b.x - a.x;
+                let dy = b.y - a.y;
+                let dist = Math.hypot(dx, dy) || 1;
+                if (dist >= MIN_CENTER_DISTANCE) continue;
+                anyOverlap = true;
+                const overlap = MIN_CENTER_DISTANCE - dist;
+                const push = overlap / 2;
+                dx /= dist;
+                dy /= dist;
+                // Push each center half the needed distance in opposite directions
+                a.x -= dx * push;
+                a.y -= dy * push;
+                b.x += dx * push;
+                b.y += dy * push;
+              }
+            }
+            if (!anyOverlap) break;
+          }
+          const pointsWithAngle = [];
+          for (let c = 0; c < centers.length; c++) {
+            const members = byCluster.get(c) || [];
+            members.forEach(({ item }, idx) => {
+              const angle = (idx / members.length) * Math.PI * 2;
+              pointsWithAngle.push({
+                ...item,
+                clusterId: c,
+                angleInCluster: angle,
+                px: centers[c].x,
+                py: centers[c].y,
+              });
+            });
+          }
+          return { centers, pointsWithAngle };
+        })()
+      : null;
+
+  $: imagePoints =
+    viewMode === 'cluster' && clusterLayout
+      ? clusterLayout.pointsWithAngle
+      : positionedImages.map((item) => {
+          const point =
+            collisionFreePixels.get(item.id) || toPixelPoint(item, plotWidth, plotHeight, !loading);
+          return {
+            ...item,
+            px: point.px,
+            py: point.py,
+          };
+        });
+
+  $: clusterCenters = clusterLayout ? clusterLayout.centers : [];
+  $: ringRadius = CLUSTER_RING_RADIUS;
 
   function randomCoord(overscanRatio = 0) {
     return -overscanRatio + Math.random() * (1 + overscanRatio * 2);
@@ -472,6 +617,20 @@
   {:else if error}
     <ErrorView error={error} onReset={resetToEntry} />
   {:else}
+    <div class="view-mode-toggle">
+      <button
+        type="button"
+        class="view-mode-btn"
+        class:active={viewMode === 'scatter'}
+        on:click={() => (viewMode = 'scatter')}
+      >Scatter</button>
+      <button
+        type="button"
+        class="view-mode-btn"
+        class:active={viewMode === 'cluster'}
+        on:click={() => (viewMode = 'cluster')}
+      >Cluster</button>
+    </div>
     <div class="canvas-clip">
       <ScatterPlot
         points={imagePoints}
@@ -481,6 +640,9 @@
         worldHeight={plotHeight}
         {spriteSize}
         isLoading={loading}
+        viewMode={viewMode}
+        clusterCenters={clusterCenters}
+        {ringRadius}
         onHover={(point) => (hoveredBlock = point)}
         onBlockClick={handleBlockClick}
       />
@@ -541,6 +703,37 @@
     background: #fff;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     position: relative;
+  }
+
+  .view-mode-toggle {
+    position: absolute;
+    top: 4%;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1002;
+    display: flex;
+    gap: 0.25rem;
+  }
+
+  .view-mode-btn {
+    padding: 0.35rem 0.75rem;
+    font-size: 0.85rem;
+    border: 2px solid #d9d9d9;
+    border-radius: 8px;
+    background: #fff;
+    color: #666;
+    cursor: pointer;
+  }
+
+  .view-mode-btn:hover {
+    border-color: #999;
+    color: #333;
+  }
+
+  .view-mode-btn.active {
+    border-color: #ff3e00;
+    background: #ff3e00;
+    color: #fff;
   }
 
   /* Clips scatter plot to rounded rect; outside is main's white background */

@@ -8,6 +8,9 @@
   export let worldHeight = 800;
   export let spriteSize = 24;
   export let isLoading = false;
+  export let viewMode = 'scatter';
+  export let clusterCenters = [];
+  export let ringRadius = 90;
   export let onHover = () => {};
   export let onBlockClick = () => {};
 
@@ -46,6 +49,8 @@
   let minimapIntentWorldX = null;
   let minimapIntentWorldY = null;
   let minimapIntentActiveUntilMs = 0;
+  let clusterRotationAngle = 0;
+  const CLUSTER_ROTATION_SPEED = 0.00005;
 
   const BASE_CONCURRENT_IMAGE_LOADS = 20;
   const LARGE_DATASET_MAX_CONCURRENT_IMAGE_LOADS = 32;
@@ -68,8 +73,9 @@
   const MINIMAP_MAX_WIDTH = 220;
   const MINIMAP_MAX_HEIGHT = 160;
   const MINIMAP_MIN_SIZE = 120;
-  // Prevent full zoom-out so oversized datasets cannot all fit onscreen at once.
-  const MIN_ZOOM = 1;
+  const MINIMAP_ZOOM_OUT_FACTOR = 1.4; // >1 = show more world in the minimap
+  // Allow further zoom-out to see more of the layout at once.
+  const MIN_ZOOM = 0.6;
   const MAX_ZOOM = 6;
   const HIGH_RES_SOURCE_SWITCH_PX = 72;
   const EAGER_PRELOAD_HIGH_PRIORITY_COUNT = 700;
@@ -379,21 +385,38 @@
     buildSpatialIndex(rendered);
   }
 
+  function getClusterPosition(point) {
+    if (viewMode !== 'cluster' || !clusterCenters.length) return null;
+    const cid = point.clusterId;
+    const angle = (point.angleInCluster ?? 0) + clusterRotationAngle;
+    const center = clusterCenters[cid];
+    if (!center) return null;
+    return {
+      x: center.x + ringRadius * Math.cos(angle),
+      y: center.y + ringRadius * Math.sin(angle),
+    };
+  }
+
   function syncMotionTargets() {
     sourcePointById = new Map(points.map((point) => [point.id, point]));
     const nextIds = new Set(points.map((point) => point.id));
 
     for (const point of points) {
+      const pos =
+        viewMode === 'cluster'
+          ? getClusterPosition(point)
+          : { x: point.px, y: point.py };
+      if (!pos) continue;
       const existing = motionById.get(point.id);
       if (existing) {
-        existing.targetX = point.px;
-        existing.targetY = point.py;
+        existing.targetX = pos.x;
+        existing.targetY = pos.y;
       } else {
         motionById.set(point.id, {
-          x: point.px,
-          y: point.py,
-          targetX: point.px,
-          targetY: point.py,
+          x: pos.x,
+          y: pos.y,
+          targetX: pos.x,
+          targetY: pos.y,
         });
       }
     }
@@ -482,13 +505,22 @@
       if (entry?.loaded) {
         const drawWidth = entry.drawWidth || spriteSize;
         const drawHeight = entry.drawHeight || spriteSize;
+        const cx = motion.x;
+        const cy = motion.y;
+        const radius = Math.min(drawWidth, drawHeight) / 2;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.closePath();
+        ctx.clip();
         ctx.drawImage(
           entry.img,
-          motion.x - drawWidth / 2,
-          motion.y - drawHeight / 2,
+          cx - drawWidth / 2,
+          cy - drawHeight / 2,
           drawWidth,
           drawHeight
         );
+        ctx.restore();
       }
     }
 
@@ -578,14 +610,15 @@
 
     if (!worldWidth || !worldHeight) return;
 
-    const scale = Math.min(minimapWidth / Math.max(1, worldWidth), minimapHeight / Math.max(1, worldHeight));
+    const scaleBase = Math.min(
+      minimapWidth / Math.max(1, worldWidth),
+      minimapHeight / Math.max(1, worldHeight)
+    );
+    const scale = scaleBase / MINIMAP_ZOOM_OUT_FACTOR;
     const contentWidth = worldWidth * scale;
     const contentHeight = worldHeight * scale;
     const offsetX = (minimapWidth - contentWidth) / 2;
     const offsetY = (minimapHeight - contentHeight) / 2;
-
-    minimapCtx.fillStyle = 'rgba(0, 0, 0, 0.2)';
-    minimapCtx.fillRect(offsetX, offsetY, contentWidth, contentHeight);
 
     minimapCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
     for (const point of renderedPointById.values()) {
@@ -596,9 +629,12 @@
         (sourcePoint.originalUrl ? imageByUrl.get(sourcePoint.originalUrl) : null);
       const drawW = Math.max(1, (entry?.drawWidth || spriteSize) * scale);
       const drawH = Math.max(1, (entry?.drawHeight || spriteSize) * scale);
-      const x = offsetX + point.px * scale - drawW / 2;
-      const y = offsetY + point.py * scale - drawH / 2;
-      minimapCtx.fillRect(x, y, drawW, drawH);
+      const cx = offsetX + point.px * scale;
+      const cy = offsetY + point.py * scale;
+      const r = Math.min(drawW, drawH) / 2;
+      minimapCtx.beginPath();
+      minimapCtx.arc(cx, cy, r, 0, Math.PI * 2);
+      minimapCtx.fill();
     }
 
     const cameraViewWidth = viewportWidth / zoom;
@@ -612,9 +648,7 @@
     minimapCtx.lineWidth = 2;
     minimapCtx.strokeRect(cameraLeft, cameraTop, cameraWidth, cameraHeight);
 
-    minimapCtx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
-    minimapCtx.lineWidth = 1;
-    minimapCtx.strokeRect(offsetX + 0.5, offsetY + 0.5, contentWidth - 1, contentHeight - 1);
+    // Removed inner content border to avoid a stray box when zoomed out
   }
 
   function getVisiblePointIds(minX, maxX, minY, maxY) {
@@ -664,11 +698,25 @@
     const dtMs = Math.max(1, Math.min(100, nowMs - prevFrame));
     lastFrameAt = nowMs;
 
+    if (viewMode === 'cluster' && clusterCenters.length > 0) {
+      clusterRotationAngle += CLUSTER_ROTATION_SPEED * dtMs;
+      if (clusterRotationAngle > Math.PI * 2) clusterRotationAngle -= Math.PI * 2;
+      for (const point of points) {
+        const pos = getClusterPosition(point);
+        if (!pos) continue;
+        const motion = motionById.get(point.id);
+        if (motion) {
+          motion.targetX = pos.x;
+          motion.targetY = pos.y;
+        }
+      }
+    }
+
     const moving = updateMotion(dtMs);
     if (moving) refreshRenderedPoints();
     draw(nowMs);
 
-    const keepRunning = moving;
+    const keepRunning = moving || (viewMode === 'cluster' && clusterCenters.length > 0);
     if (keepRunning) {
       scheduleDrawFrame();
     } else {
