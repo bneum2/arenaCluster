@@ -9,6 +9,7 @@
   export let spriteSize = 24;
   export let isLoading = false;
   export let onHover = () => {};
+  export let onBlockClick = () => {};
 
   let canvasEl;
   let ctx;
@@ -34,6 +35,10 @@
   let dragPointerId = null;
   let lastDragScreenX = 0;
   let lastDragScreenY = 0;
+  let pointerDownScreenX = 0;
+  let pointerDownScreenY = 0;
+  let pointerDownPointId = null;
+  const CLICK_MAX_MOVE_PX = 6;
   let hasCameraInteraction = false;
   let firstPaintUntilMs = 0;
   let previousPointCount = 0;
@@ -730,6 +735,10 @@
   function handlePointerDown(event) {
     if (!canvasEl || event.button !== 0) return;
     const { x, y } = getViewportPointFromEvent(event);
+    const world = screenToWorld(x, y);
+    pointerDownPointId = findHoveredPointId(world.x, world.y);
+    pointerDownScreenX = x;
+    pointerDownScreenY = y;
     isDragging = true;
     dragPointerId = event.pointerId;
     lastDragScreenX = x;
@@ -747,7 +756,15 @@
   }
 
   function handlePointerUp(event) {
+    const { x, y } = getViewportPointFromEvent(event);
+    const move = Math.hypot(x - pointerDownScreenX, y - pointerDownScreenY);
+    const wasClick = move <= CLICK_MAX_MOVE_PX && pointerDownPointId != null;
     stopDragging(event.pointerId);
+    if (wasClick && onBlockClick && pointerDownPointId) {
+      const point = sourcePointById.get(pointerDownPointId) ?? renderedPointById.get(pointerDownPointId) ?? null;
+      if (point) onBlockClick(point);
+    }
+    pointerDownPointId = null;
   }
 
   function handlePointerCancel(event) {
@@ -945,8 +962,8 @@
 
   .minimap-canvas {
     position: absolute;
-    bottom: 16px;
-    left: 16px;
+    bottom: 2%; /* increase to move up (e.g. 4%), decrease to move down (e.g. 1% or 12px) */
+    left: 1.5%;
     z-index: 2;
     pointer-events: auto;
     cursor: pointer;

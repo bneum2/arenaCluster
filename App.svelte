@@ -5,7 +5,7 @@
   import LoadingOverlay from './src/components/LoadingOverlay.svelte';
   import ErrorView from './src/components/ErrorView.svelte';
   import ScatterPlot from './src/components/ScatterPlot.svelte';
-  import HoverCard from './src/components/HoverCard.svelte';
+  import CornerCircle from './src/components/CornerCircle.svelte';
 
   const SUGGESTED_CHANNELS = ['kit-madness', 'best-textures', 'idk-n-yi8fdktls'];
 
@@ -14,6 +14,8 @@
   let channelInput = '';
   let channelSlug = null;
   let hoveredBlock = null;
+  /** One slot per corner: [top-left, top-right, bottom-right]. Bottom-left = minimap. */
+  let selectedBlocks = [null, null, null];
   let positionedImages = [];
 
   let viewportWidth = 1200;
@@ -384,6 +386,29 @@
     error = '';
     channelSlug = null;
     hoveredBlock = null;
+    selectedBlocks = [null, null, null];
+  }
+
+  function isBlockSelected(block) {
+    return block && selectedBlocks.some((b) => b && b.id === block.id);
+  }
+
+  function handleBlockClick(block) {
+    const idx = selectedBlocks.findIndex((b) => b && b.id === block.id);
+    if (idx >= 0) {
+      selectedBlocks[idx] = null;
+      selectedBlocks = selectedBlocks;
+      return;
+    }
+    let slot = selectedBlocks.findIndex((b) => !b);
+    if (slot < 0) slot = 0;
+    selectedBlocks[slot] = block;
+    selectedBlocks = selectedBlocks;
+  }
+
+  function clearSlot(slotIndex) {
+    selectedBlocks[slotIndex] = null;
+    selectedBlocks = selectedBlocks;
   }
 
   onMount(() => {
@@ -447,16 +472,48 @@
   {:else if error}
     <ErrorView error={error} onReset={resetToEntry} />
   {:else}
-    <ScatterPlot
-      points={imagePoints}
-      {viewportWidth}
-      {viewportHeight}
-      worldWidth={plotWidth}
-      worldHeight={plotHeight}
-      {spriteSize}
-      isLoading={loading}
-      onHover={(point) => (hoveredBlock = point)}
-    />
+    <div class="canvas-clip">
+      <ScatterPlot
+        points={imagePoints}
+        {viewportWidth}
+        {viewportHeight}
+        worldWidth={plotWidth}
+        worldHeight={plotHeight}
+        {spriteSize}
+        isLoading={loading}
+        onHover={(point) => (hoveredBlock = point)}
+        onBlockClick={handleBlockClick}
+      />
+    </div>
+    <!-- Corner circles: top-left, top-right, bottom-right. Each can show one selected block. Bottom-left = minimap. -->
+    {#each [0, 1, 2] as slotIndex}
+      {@const block = selectedBlocks[slotIndex]}
+      {@const corners = ['top-left', 'top-right', 'bottom-right']}
+      <CornerCircle
+        corner={corners[slotIndex]}
+        expanded={block != null}
+        onToggle={() => clearSlot(slotIndex)}
+        label={block ? 'Collapse detail' : 'Click a point to show here'}
+      >
+        {#if block}
+          <div class="detail-panel-inner">
+            {#if block.thumbUrl}
+              <a href="https://www.are.na/block/{block.id}" target="_blank" rel="noopener noreferrer" class="detail-image-wrap">
+                <img src={block.thumbUrl} alt={block.title || 'Block'} class="detail-image" />
+              </a>
+            {/if}
+            <div class="detail-panel-footer">
+              <h3>{block.title || 'Untitled'}</h3>
+              <button type="button" class="close-btn" on:click={(e) => { e.stopPropagation(); clearSlot(slotIndex); }}>×</button>
+            </div>
+          </div>
+        {:else}
+          <div class="detail-panel-inner">
+            <p class="detail-placeholder">Click a point on the map to show it here.</p>
+          </div>
+        {/if}
+      </CornerCircle>
+    {/each}
     {#if loading}
       <LoadingOverlay
         pipelineProgress={pipelineProgress}
@@ -467,8 +524,6 @@
       />
     {/if}
   {/if}
-
-  <HoverCard block={hoveredBlock} />
 </main>
 
 <style>
@@ -486,5 +541,131 @@
     background: #fff;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     position: relative;
+  }
+
+  /* Clips scatter plot to rounded rect; outside is main's white background */
+  .canvas-clip {
+    position: absolute;
+    top: 2%;
+    left: 1%;
+    width: 98%;
+    height: 96%;
+    border: 2px solid #d9d9d9;
+    border-radius: 10px;
+    overflow: hidden;
+    z-index: 0;
+  }
+
+  .canvas-clip :global(.scatterplot-root) {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* Detail panel inner (matches old app) */
+  .detail-panel-inner {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 360px;
+    min-height: 100%;
+    padding: 1.5em;
+    box-sizing: border-box;
+  }
+
+  .detail-panel-inner h3 {
+    margin: 0 0 0.5em 0;
+    color: #333;
+    font-size: 1em;
+    font-weight: 600;
+  }
+
+  .detail-panel-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75em;
+    margin-top: auto;
+    padding-top: 1em;
+  }
+
+  .detail-panel-footer h3 {
+    margin: 0;
+    color: #333;
+    font-size: 1em;
+    font-weight: 600;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .channel-slug {
+    word-break: break-all;
+    color: #666;
+    font-size: 0.9em;
+    margin: 0.25em 0;
+  }
+
+  .detail-placeholder,
+  .detail-panel-inner p {
+    color: #666;
+    font-size: 0.95em;
+    margin: 0.25em 0;
+  }
+
+  .detail-panel-inner .meta {
+    font-size: 0.8rem;
+    color: #888;
+  }
+
+  .back-btn {
+    margin-top: 0.75rem;
+    padding: 0.6rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: white;
+    background: #ff3e00;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+
+  .back-btn:hover {
+    background: #e63900;
+  }
+
+  .detail-image-wrap {
+    display: block;
+    flex: 1;
+    min-height: 0;
+    margin-bottom: 0;
+  }
+
+  .detail-image {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: min(35vh, 280px);
+    object-fit: contain;
+    border-radius: 8px;
+  }
+
+  .close-btn {
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    font-size: 24px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 0.2s;
+    color: #666;
+  }
+
+  .close-btn:hover {
+    color: #ff3e00;
   }
 </style>
